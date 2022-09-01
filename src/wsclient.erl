@@ -28,8 +28,6 @@
          code_change/4
         ]).
 
--define(SERVER, ?MODULE).
-
 -record(state, {
           name,
           address,
@@ -40,17 +38,20 @@
           handler_module,
           handler_state,
           reconnect_timeout,
+          idle_timeout,
           open_timeout,
           connect_try,
           pid
          }).
+
+-define(IDLE_TIMEOUT, Data#state.idle_timeout).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
 start_link(Args) ->
-    gen_statem:start_link({local, ?SERVER}, ?MODULE, Args, []).
+    gen_statem:start_link(?MODULE, Args, []).
 
 callback_mode() ->
     [state_functions, state_enter].
@@ -72,13 +73,13 @@ do_connect(enter, _, Data) ->
                            Data#state.opts),
       {keep_state,
        Data#state{pid=Pid, connect_try=Data#state.connect_try+1,handler_state=State1},
-       [{state_timeout,Data#state.open_timeout,gun_timeout}] 
+       [{state_timeout,Data#state.open_timeout,gun_timeout}]
       };
     stop ->
       stop
   end;
 
-  
+
 do_connect(state_timeout, gun_timeout, Data) ->
   logger:debug("~s do_connect timeout",[Data#state.name]),
   {next_state, do_close, Data};
@@ -96,7 +97,7 @@ do_connect(info, Msg, Data) ->
   keep_state_and_data;
 
 do_connect(Kind, Msg, Data) ->
-  logger:notice("~s do_connect ~p:~p",[Data#state.name, Kind, Msg]),
+  logger:notice("~s do_connect ~p:~p, dying",[Data#state.name, Kind, Msg]),
   stop.
 
 do_upgrade(enter, do_connect, Data) ->
@@ -130,17 +131,17 @@ do_upgrade(info, {gun_response, Pid, _Ref, _Fin, ErrorCode, _Headers}, Data) whe
   {next_state, do_close, Data};
 
 do_upgrade(info, Msg, Data) ->
-  logger:info("~s do_upgrade unexpected info ~p, dropped",[Data#state.name, Msg]),
+  logger:notice("~s do_upgrade unexpected info ~p, dropped",[Data#state.name, Msg]),
   keep_state_and_data;
 
 do_upgrade(Kind, Msg, Data) ->
-  logger:info("~s do_upgrade ~p:~p",[Data#state.name, Kind, Msg]),
+  logger:notice("~s do_upgrade ~p:~p, dying",[Data#state.name, Kind, Msg]),
   stop.
 
 do_close(enter, _, Data) ->
   gun:close(Data#state.pid),
-  Timeout=max(100,min(Data#state.reconnect_timeout*Data#state.connect_try,300000)),
-  logger:info("~s Closed, try ~w, wait ~w",[Data#state.name, Data#state.connect_try, Timeout]),
+  Timeout=max(100,min(Data#state.reconnect_timeout*Data#state.connect_try,300_000)),
+  %logger:info("~s Closed, try ~w, wait ~w",[Data#state.name, Data#state.connect_try, Timeout]),
   erlang:send_after(Timeout, self(), connect),
   {keep_state, Data#state{pid=undefined}};
 
@@ -152,11 +153,11 @@ do_close(info, connect, Data) ->
   {next_state, do_connect, Data};
 
 do_close(info, Msg, Data) ->
-  logger:info("~s do_close unexpected info ~p, dropped",[Data#state.name, Msg]),
+  logger:notice("~s do_close unexpected info ~p, dropped",[Data#state.name, Msg]),
   keep_state_and_data;
 
 do_close(Kind, Msg, Data) ->
-  logger:info("~s do_close ~p:~p",[Data#state.name, Kind, Msg]),
+  logger:notice("~s do_close unexpected message ~p:~p, dying",[Data#state.name, Kind, Msg]),
   stop.
 
 do_work(enter, do_upgrade, _Data) ->
@@ -170,10 +171,22 @@ do_work(info, {gun_ws, Pid, _Ref, Payload}, Data) when Pid==Data#state.pid ->
                                                   Payload,
                                                   Data#state.handler_state) of
     {noreply, State1} ->
-      {keep_state, Data#state{handler_state=State1}};
+      {keep_state, Data#state{handler_state=State1},
+       [{state_timeout,?IDLE_TIMEOUT,idle}]
+      };
+    {reply, Replys, State1} when is_list(Replys) ->
+      [
+       ok=gun:ws_send(Data#state.pid, Reply)
+       || Reply <- Replys
+      ],
+      {keep_state, Data#state{handler_state=State1},
+       [{state_timeout,?IDLE_TIMEOUT,idle}]
+      };
     {reply, Reply, State1} ->
       ok=gun:ws_send(Data#state.pid, Reply),
-      {keep_state, Data#state{handler_state=State1}}
+      {keep_state, Data#state{handler_state=State1},
+       [{state_timeout,?IDLE_TIMEOUT,idle}]
+      }
   end;
 
 do_work(info, Info, Data) ->
@@ -182,13 +195,27 @@ do_work(info, Info, Data) ->
                                                Data#state.handler_state) of
     {noreply, State1} ->
       {keep_state, Data#state{handler_state=State1}};
+    {reply, Replys, State1} when is_list(Replys) ->
+      [
+       ok=gun:ws_send(Data#state.pid, Reply)
+       || Reply <- Replys
+      ],
+      {keep_state, Data#state{handler_state=State1},
+       [{state_timeout,?IDLE_TIMEOUT,idle}]
+      };
     {reply, Reply, State1} ->
       ok=gun:ws_send(Data#state.pid, Reply),
       {keep_state, Data#state{handler_state=State1}}
   end;
 
+do_work(state_timeout, idle, Data) ->
+  ok=gun:ws_send(Data#state.pid, ping),
+  {keep_state, Data,
+   [{state_timeout,?IDLE_TIMEOUT,idle}]
+  };
+
 do_work(Kind, Msg, Data) ->
-  logger:info("~s do_work ~p:~p",[Data#state.name, Kind, Msg]),
+  logger:notice("~s do_work unexpected message ~p:~p, dying",[Data#state.name, Kind, Msg]),
   stop.
 
 terminate(_Reason, _State, _Data) ->
@@ -213,7 +240,8 @@ parse_args(#{name:=Name,address:=Addr,port:=Port,wsurl:=WsURL,handler:=M}=Args) 
      handler_module=M,
      handler_state=maps:get(state,Args,#{}),
      reconnect_timeout=maps:get(reconnect_timeout, Args, 500),
-     open_timeout=maps:get(open_timeout, Args, 5000),
+     idle_timeout=maps:get(idle_timeout, Args, 300_000),
+     open_timeout=maps:get(open_timeout, Args, 5_000),
      connect_try=0
     }.
 
